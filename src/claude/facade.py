@@ -10,6 +10,8 @@ from typing import Any, Callable, Dict, List, Optional
 import structlog
 
 from ..config.settings import Settings
+from .claude_mem_integration import get_observer
+from .memory_tags import extract_memory_tags, format_tags_as_facts
 from .sdk_integration import ClaudeResponse, ClaudeSDKManager, StreamUpdate
 from .session import SessionManager
 
@@ -51,9 +53,24 @@ class ClaudeIntegration:
             force_new=force_new,
         )
 
+        # Extract memory tags from prompt
+        cleaned_prompt, memory_tags = extract_memory_tags(prompt)
+        tags_found = len(memory_tags) > 0
+
+        if tags_found:
+            logger.info(
+                "Memory tags extracted",
+                tag_count=len(memory_tags),
+                tags=[str(tag) for tag in memory_tags],
+            )
+
+        # Use cleaned prompt (without memory tags) for Claude
+        prompt = cleaned_prompt
+
         # If no session_id provided, try to find an existing session for this
         # user+directory combination (auto-resume).
         # Skip auto-resume when force_new is set (e.g. after /new command).
+        existing_session = None
         if not session_id and not force_new:
             existing_session = await self._find_resumable_session(
                 user_id, working_directory
@@ -66,6 +83,19 @@ class ClaudeIntegration:
                     project_path=str(working_directory),
                     user_id=user_id,
                 )
+        elif force_new and not session_id:
+            # Complete the old session when starting a new one
+            existing_session = await self._find_resumable_session(
+                user_id, working_directory
+            )
+            if existing_session and existing_session.session_id:
+                observer = get_observer()
+                if observer:
+                    logger.info(
+                        "Completing old session before starting new one",
+                        old_session_id=existing_session.session_id,
+                    )
+                    await observer.complete_session(existing_session.session_id)
 
         # Get or create session
         session = await self.session_manager.get_or_create_session(
@@ -90,6 +120,7 @@ class ClaudeIntegration:
                     stream_callback=on_stream,
                     interrupt_event=interrupt_event,
                     images=images,
+                    memory_tags=memory_tags,
                 )
             except Exception as resume_error:
                 # If resume failed (e.g., session expired/missing on Claude's side),
@@ -161,6 +192,7 @@ class ClaudeIntegration:
         stream_callback: Optional[Callable] = None,
         interrupt_event: Optional[asyncio.Event] = None,
         images: Optional[List[Dict[str, str]]] = None,
+        memory_tags: Optional[List] = None,
     ) -> ClaudeResponse:
         """Execute command via SDK."""
         return await self.sdk_manager.execute_command(
@@ -171,6 +203,7 @@ class ClaudeIntegration:
             stream_callback=stream_callback,
             interrupt_event=interrupt_event,
             images=images,
+            memory_tags=memory_tags or [],
         )
 
     async def _find_resumable_session(

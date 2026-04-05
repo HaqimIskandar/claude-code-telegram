@@ -23,6 +23,7 @@ from claude_agent_sdk import (
     TextBlock,
     ThinkingBlock,
     ToolPermissionContext,
+    ToolResultBlock,
     ToolUseBlock,
     UserMessage,
 )
@@ -32,6 +33,7 @@ from claude_agent_sdk.types import StreamEvent
 
 from ..config.settings import Settings
 from ..security.validators import SecurityValidator
+from .claude_mem_integration import get_observer
 from .exceptions import (
     ClaudeMCPError,
     ClaudeParsingError,
@@ -41,6 +43,24 @@ from .exceptions import (
 from .monitor import _is_claude_internal_path, check_bash_directory_boundary
 
 logger = structlog.get_logger()
+
+
+def _extract_project_name(working_directory: Path) -> str:
+    """Extract project name from working directory path.
+
+    Examples:
+        /home/six/SIX → "SIX"
+        /home/six/Projects/Ongoing/CodeCompass → "CodeCompass"
+        /home/six/Projects/Forked/claude-code-telegram → "claude-code-telegram"
+
+    Args:
+        working_directory: Path to project directory
+
+    Returns:
+        Project name (last directory component)
+    """
+    return working_directory.name
+
 
 # Fallback message when Claude produces no text but did use tools.
 TASK_COMPLETED_MSG = "✅ Task completed. Tools used: {tools_summary}"
@@ -277,6 +297,7 @@ class ClaudeSDKManager:
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
         interrupt_event: Optional[asyncio.Event] = None,
         images: Optional[List[Dict[str, str]]] = None,
+        memory_tags: Optional[List] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -318,6 +339,14 @@ class ClaudeSDKManager:
                 sdk_allowed_tools = self.config.claude_allowed_tools
                 sdk_disallowed_tools = self.config.claude_disallowed_tools
 
+            # Build environment for SDK subprocess
+            sdk_env = {}
+            # Pass through custom API endpoint if configured
+            if os.environ.get("ANTHROPIC_BASE_URL"):
+                sdk_env["ANTHROPIC_BASE_URL"] = os.environ["ANTHROPIC_BASE_URL"]
+            if os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+                sdk_env["ANTHROPIC_AUTH_TOKEN"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
+
             # Build Claude Agent options
             options = ClaudeAgentOptions(
                 max_turns=self.config.claude_max_turns,
@@ -336,6 +365,7 @@ class ClaudeSDKManager:
                 system_prompt=base_prompt,
                 setting_sources=["project"],
                 stderr=_stderr_callback,
+                env=sdk_env if sdk_env else None,
             )
 
             # Pass MCP server configuration if enabled
@@ -365,6 +395,11 @@ class ClaudeSDKManager:
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
             interrupted = False
+
+            # Track pending tool uses and observations for claude-mem
+            pending_tool_uses: Dict[str, Dict[str, Any]] = {}
+            pending_observations: List[Dict[str, Any]] = []
+            claude_mem_observer = get_observer()
 
             async def _run_client() -> None:
                 client = ClaudeSDKClient(options)
@@ -416,6 +451,33 @@ class ClaudeSDKManager:
 
                         if isinstance(message, ResultMessage):
                             break
+
+                        # Track tool uses for claude-mem observations
+                        if isinstance(message, AssistantMessage):
+                            content = getattr(message, "content", [])
+                            if isinstance(content, list):
+                                for block in content:
+                                    if isinstance(block, ToolUseBlock):
+                                        pending_tool_uses[block.id] = {
+                                            "name": block.name,
+                                            "input": block.input,
+                                        }
+
+                        # Send observation when tool result arrives
+                        if isinstance(message, UserMessage):
+                            content = getattr(message, "content", [])
+                            if isinstance(content, list):
+                                for block in content:
+                                    if isinstance(block, ToolResultBlock):
+                                        tool_use_id = block.tool_use_id
+                                        if tool_use_id in pending_tool_uses:
+                                            tool_info = pending_tool_uses.pop(tool_use_id)
+                                            # Queue observation for sending after we get session_id
+                                            pending_observations.append({
+                                                "tool_name": tool_info["name"],
+                                                "tool_input": tool_info["input"],
+                                                "tool_response": {"content": block.content, "is_error": block.is_error},
+                                            })
 
                         # Handle streaming callback
                         if stream_callback:
@@ -564,6 +626,49 @@ class ClaudeSDKManager:
                     claude_session_id=claude_session_id,
                     previous_session_id=session_id,
                 )
+
+            # Initialize claude-mem session with user prompt before sending observations
+            if pending_observations and claude_mem_observer and final_session_id:
+                project_name = _extract_project_name(working_directory)
+
+                # Append memory tags to prompt for explicit storage
+                enhanced_prompt = prompt
+                if memory_tags:
+                    from .memory_tags import format_tags_as_facts
+                    tag_facts = format_tags_as_facts(memory_tags)
+                    if tag_facts:
+                        enhanced_prompt = f"{prompt}\n\n{chr(10).join(tag_facts)}"
+                        logger.debug(
+                            "Memory tags added to prompt",
+                            tag_count=len(memory_tags),
+                            facts=tag_facts,
+                        )
+
+                logger.debug(
+                    "Initializing claude-mem session",
+                    session_id=final_session_id,
+                    project=project_name,
+                )
+                await claude_mem_observer.init_session(
+                    content_session_id=final_session_id,
+                    user_prompt=enhanced_prompt,
+                    project=project_name,
+                )
+
+                # Now send queued observations to claude-mem
+                logger.debug(
+                    "Sending queued observations to claude-mem",
+                    observation_count=len(pending_observations),
+                    session_id=final_session_id,
+                )
+                for obs in pending_observations:
+                    await claude_mem_observer.send_observation_non_blocking(
+                        content_session_id=final_session_id,
+                        tool_name=obs["tool_name"],
+                        tool_input=obs["tool_input"],
+                        tool_response=obs["tool_response"],
+                        cwd=str(working_directory),
+                    )
 
             # Use ResultMessage.result if available, fall back to message extraction
             if result_content is not None:

@@ -16,6 +16,7 @@ from src.claude import (
     ClaudeIntegration,
     SessionManager,
 )
+from src.claude.claude_mem_integration import initialize_observer
 from src.claude.sdk_integration import ClaudeSDKManager
 from src.config.features import FeatureFlags
 from src.config.settings import Settings
@@ -143,6 +144,9 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # Create Claude SDK manager and integration facade
     logger.info("Using Claude Python SDK integration")
     sdk_manager = ClaudeSDKManager(config, security_validator=security_validator)
+
+    # Initialize claude-mem observer for real-time capture
+    initialize_observer()
 
     claude_integration = ClaudeIntegration(
         config=config,
@@ -348,7 +352,7 @@ async def run_application(app: Dict[str, Any]) -> None:
         logger.error("Application error", error=str(e))
         raise
     finally:
-        # Ordered shutdown: scheduler -> API -> notification -> bot -> claude -> storage
+        # Ordered shutdown: scheduler -> API -> notification -> bot -> claude -> storage -> claude-mem
         logger.info("Shutting down application")
 
         try:
@@ -360,6 +364,10 @@ async def run_application(app: Dict[str, Any]) -> None:
             await bot.stop()
             await claude_integration.shutdown()
             await storage.close()
+
+            # Shutdown claude-mem observer
+            from src.claude.claude_mem_integration import shutdown_observer
+            await shutdown_observer()
         except Exception as e:
             logger.error("Error during shutdown", error=str(e))
 

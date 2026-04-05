@@ -327,6 +327,7 @@ class MessageOrchestrator:
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
+            ("memory", self.agentic_memory),
             ("restart", command.restart_command),
         ]
         if self.settings.enable_project_threads:
@@ -621,6 +622,91 @@ class MessageOrchestrator:
             f"Verbosity set to <b>{level}</b> ({labels[level]})",
             parse_mode="HTML",
         )
+
+    async def agentic_memory(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Search claude-mem for relevant past context."""
+        query = " ".join(update.message.text.split()[1:]).strip()
+
+        if not query:
+            await update.message.reply_text(
+                "🔍 <b>Memory Search</b>\n\n"
+                "Usage: <code>/memory your query here</code>\n\n"
+                "Examples:\n"
+                "• /memory CodeCompass\n"
+                "• /memory API key\n"
+                "• /memory what did we work on yesterday",
+                parse_mode="HTML",
+            )
+            return
+
+        # Query claude-mem search API
+        import httpx
+        from pathlib import Path
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                # Extract current project from working directory for filtering
+                current_dir = context.user_data.get(
+                    "current_directory", self.settings.approved_directory
+                )
+                current_project = Path(current_dir).name
+
+                # Build search params - filter by project to get relevant results
+                params = {"query": query, "type": "observations", "limit": 5}
+
+                # If query contains a project name, use that instead of current directory
+                # This allows cross-project searching like "/memory CodeCompass" while in SIX directory
+                # Otherwise, filter to current project for relevant results
+                if not any(word.lower() in query.lower() for word in ["codecompass", "honcho", "autocli", "six"]):
+                    params["project"] = current_project
+
+                response = await client.get(
+                    "http://127.0.0.1:37777/api/search",
+                    params=params,
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+
+                    # Search returns formatted content array
+                    content_list = data.get("content", [])
+                    if not content_list:
+                        await update.message.reply_text(
+                            f"🔍 No memories found for: <b>{query}</b>",
+                            parse_mode="HTML",
+                        )
+                        return
+
+                    # Extract text from content items
+                    search_text = "\n\n".join(
+                        item.get("text", "") for item in content_list if item.get("type") == "text"
+                    )
+
+                    if not search_text or "No results found" in search_text:
+                        await update.message.reply_text(
+                            f"🔍 No memories found for: <b>{query}</b>",
+                            parse_mode="HTML",
+                        )
+                        return
+
+                    # Truncate if too long for Telegram
+                    if len(search_text) > 3000:
+                        search_text = search_text[:3000] + "\n\n... (truncated)"
+
+                    await update.message.reply_text(
+                        f"🔍 <b>Memories for: {query}</b>\n\n{search_text}",
+                        parse_mode="HTML",
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"❌ Memory search error: {response.status_code}"
+                    )
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Memory search failed: {str(e)[:50]}"
+            )
 
     def _format_verbose_progress(
         self,
